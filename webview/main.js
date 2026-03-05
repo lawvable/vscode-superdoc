@@ -46,6 +46,19 @@ let originalEditorEmit = null; // Set in setupEditorListeners; used by cmdAddCom
 let saveTimeout = null;
 let isInitialLoad = true;
 let isExporting = false;
+let modeObserver = null; // MutationObserver for document mode dropdown highlighting
+
+// Factory for accept/reject tracked change toolbar handlers
+function makeTrackedChangeHandler(label, selectionCmd, allCmd) {
+    return ({ option }) => {
+        if (!option) return; // Called when dropdown opens (no option selected yet)
+        const activeEditor = editor?.activeEditor;
+        if (!activeEditor) return;
+        if (option.key === 'selection') activeEditor.commands[selectionCmd]();
+        else if (option.key === 'all') activeEditor.commands[allCmd]();
+        debug(`${label} changes: ${option.key}`);
+    };
+}
 
 // Initialize editor with file data
 function initializeEditor(fileArrayBuffer) {
@@ -60,6 +73,10 @@ function initializeEditor(fileArrayBuffer) {
         debug(`File created: ${file.name}, ${file.size} bytes`);
 
         // Clean up previous editor instance
+        if (modeObserver) {
+            modeObserver.disconnect();
+            modeObserver = null;
+        }
         if (editor) {
             debug('Destroying previous editor...');
             try {
@@ -140,20 +157,7 @@ function initializeEditor(fileArrayBuffer) {
                                     { label: 'Accept under selection', key: 'selection' },
                                     { label: 'Accept all changes', key: 'all' }
                                 ],
-                                command: ({ option }) => {
-                                    if (!option) return; // Called when dropdown opens (no option selected yet)
-                                    const activeEditor = editor?.activeEditor;
-                                    if (!activeEditor) { console.warn('[Accept] No active editor'); return; }
-                                    console.log('[Accept]', option.key);
-                                    let result;
-                                    if (option.key === 'selection') {
-                                        result = activeEditor.commands.acceptTrackedChangeBySelection();
-                                    } else if (option.key === 'all') {
-                                        result = activeEditor.commands.acceptAllTrackedChanges();
-                                    }
-                                    console.log('[Accept] result:', result);
-                                    debug(`Accept changes: ${option.key}`);
-                                }
+                                command: makeTrackedChangeHandler('Accept', 'acceptTrackedChangeBySelection', 'acceptAllTrackedChanges')
                             },
                             {
                                 type: 'dropdown',
@@ -166,20 +170,7 @@ function initializeEditor(fileArrayBuffer) {
                                     { label: 'Reject under selection', key: 'selection' },
                                     { label: 'Reject all changes', key: 'all' }
                                 ],
-                                command: ({ option }) => {
-                                    if (!option) return; // Called when dropdown opens (no option selected yet)
-                                    const activeEditor = editor?.activeEditor;
-                                    if (!activeEditor) { console.warn('[Reject] No active editor'); return; }
-                                    console.log('[Reject]', option.key);
-                                    let result;
-                                    if (option.key === 'selection') {
-                                        result = activeEditor.commands.rejectTrackedChangeOnSelection();
-                                    } else if (option.key === 'all') {
-                                        result = activeEditor.commands.rejectAllTrackedChanges();
-                                    }
-                                    console.log('[Reject] result:', result);
-                                    debug(`Reject changes: ${option.key}`);
-                                }
+                                command: makeTrackedChangeHandler('Reject', 'rejectTrackedChangeOnSelection', 'rejectAllTrackedChanges')
                             }
                         ]
                     }
@@ -247,7 +238,7 @@ function setupEditorListeners() {
 
     // Highlight the active document mode option when the dropdown opens
     // NPopover teleports dropdown content to document.body, so we must observe body
-    new MutationObserver(() => {
+    modeObserver = new MutationObserver(() => {
         const options = document.querySelectorAll('[data-item="btn-documentMode-option"]');
         if (options.length === 0) return;
         const currentMode = editor?.config?.documentMode || 'editing';
@@ -257,7 +248,8 @@ function setupEditorListeners() {
             const label = opt.querySelector('.document-mode-type');
             opt.classList.toggle('document-mode-active', label?.textContent?.trim() === activeLabel);
         });
-    }).observe(document.body, { childList: true, subtree: true });
+    });
+    modeObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 // Schedule auto-save with debouncing
@@ -478,14 +470,8 @@ function insertAtPosition(activeEditor, position, content) {
     activeEditor.commands.insertContent(content);
 }
 
-function selectRange(activeEditor, from, to) {
-    activeEditor.view.focus();
-    activeEditor.commands.setTextSelection({ from, to: to ?? from });
-}
-
-// Like selectRange but without view.focus() — for programmatic commands
-// that should not steal focus from other VS Code UI elements.
-function selectRangeQuiet(activeEditor, from, to) {
+function selectRange(activeEditor, from, to, { focus = true } = {}) {
+    if (focus) activeEditor.view.focus();
     activeEditor.commands.setTextSelection({ from, to: to ?? from });
 }
 
@@ -1261,7 +1247,7 @@ async function cmdAddComment({ search, comment, occurrence, author }) {
     }
 
     // Use quiet selection to avoid stealing focus from other VS Code UI
-    selectRangeQuiet(activeEditor, match.from, match.to);
+    selectRange(activeEditor, match.from, match.to, { focus: false });
 
     const authorName = author?.name || editor.user?.name || 'Claude';
     const authorEmail = author?.email || editor.user?.email || 'claude@anthropic.com';
@@ -1515,6 +1501,5 @@ document.addEventListener('keydown', (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === 's') {
         event.preventDefault();
         saveDocument();
-        vscode.postMessage({ type: 'save' });
     }
 });
