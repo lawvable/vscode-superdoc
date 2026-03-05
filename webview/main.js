@@ -412,12 +412,44 @@ function requireActiveEditor() {
     return { activeEditor };
 }
 
-function getFormattedText(activeEditor) {
+function getFormattedText(activeEditor, { resolveTrackedChanges = false } = {}) {
+    if (resolveTrackedChanges) {
+        return getTextWithTrackedChangesResolved(activeEditor.state.doc);
+    }
     try {
         return activeEditor.getText({ blockSeparator: '\n\n' });
     } catch {
         return activeEditor.state.doc.textContent;
     }
+}
+
+/**
+ * Walk the document tree and return plain text as if all tracked changes
+ * were accepted: text with `trackDelete` marks is excluded, text with
+ * `trackInsert` marks is kept (mark stripped conceptually).
+ */
+function getTextWithTrackedChangesResolved(doc) {
+    const parts = [];
+    let lastBlockPos = -1;
+
+    doc.descendants((node, pos, parent) => {
+        // Add block separator between top-level blocks
+        if (node.isBlock && node.isTextblock) {
+            if (lastBlockPos !== -1) {
+                parts.push('\n\n');
+            }
+            lastBlockPos = pos;
+        }
+
+        if (node.isText) {
+            const isDeleted = node.marks.some(m => m.type.name === 'trackDelete');
+            if (!isDeleted) {
+                parts.push(node.text);
+            }
+        }
+    });
+
+    return parts.join('');
 }
 
 function setDocumentMode(mode) {
@@ -484,7 +516,7 @@ function applyScope(activeEditor, scope) {
     }
 }
 
-function cmdGetText({ format } = {}) {
+function cmdGetText({ format, resolveTrackedChanges, head, tail } = {}) {
     const { activeEditor, error } = requireActiveEditor();
     if (error) return error;
 
@@ -495,10 +527,17 @@ function cmdGetText({ format } = {}) {
         return { success: false, error: `Invalid format: "${format}". Valid formats: ${validFormats.join(', ')}` };
     }
 
+    if (head != null && tail != null) {
+        return { success: false, error: 'Cannot use both "head" and "tail" at the same time' };
+    }
+
+    const resolve = resolveTrackedChanges === true;
     const result = {};
 
     if (selectedFormat === 'text' || selectedFormat === 'both') {
-        result.text = getFormattedText(activeEditor);
+        let text = getFormattedText(activeEditor, { resolveTrackedChanges: resolve });
+        text = truncateText(text, { head, tail });
+        result.text = text;
     }
 
     if (selectedFormat === 'html' || selectedFormat === 'both') {
@@ -506,8 +545,21 @@ function cmdGetText({ format } = {}) {
     }
 
     const charCount = result.text?.length || result.html?.length || 0;
-    debug(`getText(${selectedFormat}): ${charCount} chars`);
+    debug(`getText(${selectedFormat}, resolve=${resolve}, head=${head ?? '-'}, tail=${tail ?? '-'}): ${charCount} chars`);
     return { success: true, result };
+}
+
+function truncateText(text, { head, tail }) {
+    const h = head != null ? Math.floor(Number(head)) : null;
+    const t = tail != null ? Math.floor(Number(tail)) : null;
+
+    if (h != null && h > 0 && text.length > h) {
+        return text.slice(0, h) + `\n\n[... truncated, ${text.length - h} more chars]`;
+    }
+    if (t != null && t > 0 && text.length > t) {
+        return `[... truncated, ${text.length - t} chars skipped]\n\n` + text.slice(-t);
+    }
+    return text;
 }
 
 function cmdGetNodes({ type }) {
