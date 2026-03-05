@@ -42,8 +42,10 @@ function injectStyles() {
 }
 
 let editor = null;
+let originalEditorEmit = null; // Set in setupEditorListeners; used by cmdAddComment
 let saveTimeout = null;
 let isInitialLoad = true;
+let isExporting = false;
 
 // Initialize editor with file data
 function initializeEditor(fileArrayBuffer) {
@@ -98,11 +100,89 @@ function initializeEditor(fileArrayBuffer) {
                 toolbar: '#superdoc-toolbar',
                 document: file,
                 documentMode: 'editing',  // Default to normal editing (commands switch to suggesting mode for tracked changes)
+                role: 'editor',
+                permissionResolver: ({ defaultDecision, permission }) => {
+                    // Allow all tracked change accept/reject actions regardless of author
+                    if (permission === 'RESOLVE_OWN' || permission === 'RESOLVE_OTHER' ||
+                        permission === 'REJECT_OWN' || permission === 'REJECT_OTHER') {
+                        return true;
+                    }
+                    return defaultDecision;
+                },
                 pagination: true,
                 rulers: true,
                 user: {
                     name: 'Claude',
                     email: 'claude@anthropic.com'
+                },
+                modules: {
+                    toolbar: {
+                        excludeItems: ['acceptTrackedChangeBySelection', 'rejectTrackedChangeOnSelection'],
+                        customButtons: [
+                            {
+                                type: 'button',
+                                name: 'findReplace',
+                                tooltip: 'Find & Replace',
+                                icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z"/></svg>',
+                                group: 'right',
+                                command: () => {
+                                    openSearchBar();
+                                }
+                            },
+                            {
+                                type: 'dropdown',
+                                name: 'acceptChanges',
+                                tooltip: 'Accept Changes',
+                                icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path d="M128 0c17.7 0 32 14.3 32 32l0 32 128 0 0-32c0-17.7 14.3-32 32-32s32 14.3 32 32l0 32 48 0c26.5 0 48 21.5 48 48l0 48L0 160l0-48C0 85.5 21.5 64 48 64l48 0 0-32c0-17.7 14.3-32 32-32zM0 192l448 0 0 272c0 26.5-21.5 48-48 48L48 512c-26.5 0-48-21.5-48-48L0 192zM329 305c9.4-9.4 9.4-24.6 0-33.9s-24.6-9.4-33.9 0l-95 95-47-47c-9.4-9.4-24.6-9.4-33.9 0s-9.4 24.6 0 33.9l64 64c9.4 9.4 24.6 9.4 33.9 0L329 305z"/></svg>',
+                                hasCaret: true,
+                                group: 'left',
+                                options: [
+                                    { label: 'Accept under selection', key: 'selection' },
+                                    { label: 'Accept all changes', key: 'all' }
+                                ],
+                                command: ({ option }) => {
+                                    if (!option) return; // Called when dropdown opens (no option selected yet)
+                                    const activeEditor = editor?.activeEditor;
+                                    if (!activeEditor) { console.warn('[Accept] No active editor'); return; }
+                                    console.log('[Accept]', option.key);
+                                    let result;
+                                    if (option.key === 'selection') {
+                                        result = activeEditor.commands.acceptTrackedChangeBySelection();
+                                    } else if (option.key === 'all') {
+                                        result = activeEditor.commands.acceptAllTrackedChanges();
+                                    }
+                                    console.log('[Accept] result:', result);
+                                    debug(`Accept changes: ${option.key}`);
+                                }
+                            },
+                            {
+                                type: 'dropdown',
+                                name: 'rejectChanges',
+                                tooltip: 'Reject Changes',
+                                icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path d="M128 0c17.7 0 32 14.3 32 32l0 32 128 0 0-32c0-17.7 14.3-32 32-32s32 14.3 32 32l0 32 48 0c26.5 0 48 21.5 48 48l0 48L0 160l0-48C0 85.5 21.5 64 48 64l48 0 0-32c0-17.7 14.3-32 32-32zM0 192l448 0 0 272c0 26.5-21.5 48-48 48L48 512c-26.5 0-48-21.5-48-48L0 192zM305 305c9.4-9.4 9.4-24.6 0-33.9s-24.6-9.4-33.9 0l-47 47-47-47c-9.4-9.4-24.6-9.4-33.9 0s-9.4 24.6 0 33.9l47 47-47 47c-9.4 9.4-9.4 24.6 0 33.9s24.6 9.4 33.9 0l47-47 47 47c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-47-47 47-47z"/></svg>',
+                                hasCaret: true,
+                                group: 'left',
+                                options: [
+                                    { label: 'Reject under selection', key: 'selection' },
+                                    { label: 'Reject all changes', key: 'all' }
+                                ],
+                                command: ({ option }) => {
+                                    if (!option) return; // Called when dropdown opens (no option selected yet)
+                                    const activeEditor = editor?.activeEditor;
+                                    if (!activeEditor) { console.warn('[Reject] No active editor'); return; }
+                                    console.log('[Reject]', option.key);
+                                    let result;
+                                    if (option.key === 'selection') {
+                                        result = activeEditor.commands.rejectTrackedChangeOnSelection();
+                                    } else if (option.key === 'all') {
+                                        result = activeEditor.commands.rejectAllTrackedChanges();
+                                    }
+                                    console.log('[Reject] result:', result);
+                                    debug(`Reject changes: ${option.key}`);
+                                }
+                            }
+                        ]
+                    }
                 },
                 onReady: () => {
                     debug('SuperDoc is ready (editing mode)');
@@ -137,15 +217,47 @@ function setupEditorListeners() {
 
     debug('Setting up editor update listener');
 
-    editor.activeEditor.on('update', async ({ editor: editorInstance }) => {
-        if (isInitialLoad) return;
+    // Intercept commentsUpdate 'selected' events to prevent an infinite loop.
+    //
+    // SuperDoc's comments plugin emits 'selected' events when the cursor is
+    // inside a comment/tracked-change range. SuperDoc's internal handler
+    // (onEditorCommentsUpdate) calls setActiveComment() in response, which
+    // dispatches a new transaction, which triggers apply() again, which emits
+    // another 'selected' event — creating an infinite oscillation between
+    // selected(commentId) and selected(null) at ~1Hz.
+    //
+    // Fix: suppress 'selected' events at the emit level so they never reach
+    // the handler. Other event types (add, trackedChange, etc.) pass through.
+    originalEditorEmit = editor.activeEditor.emit.bind(editor.activeEditor);
+    editor.activeEditor.emit = function(event, ...args) {
+        if (event === 'commentsUpdate' && args[0]?.type === 'selected') {
+            return;
+        }
+        return originalEditorEmit(event, ...args);
+    };
 
-        const html = editorInstance.getHTML();
-        debug(`Content updated: ${html?.length || 0} chars`);
+    editor.activeEditor.on('update', () => {
+        if (isInitialLoad || isExporting) return;
         scheduleAutoSave();
+        // Refresh search results if search bar is open (handles undo/redo)
+        refreshSearch();
     });
 
     debug('Editor update listener ready');
+
+    // Highlight the active document mode option when the dropdown opens
+    // NPopover teleports dropdown content to document.body, so we must observe body
+    new MutationObserver(() => {
+        const options = document.querySelectorAll('[data-item="btn-documentMode-option"]');
+        if (options.length === 0) return;
+        const currentMode = editor?.config?.documentMode || 'editing';
+        const modeLabels = { editing: 'Editing', suggesting: 'Suggesting', viewing: 'Viewing' };
+        const activeLabel = modeLabels[currentMode];
+        options.forEach(opt => {
+            const label = opt.querySelector('.document-mode-type');
+            opt.classList.toggle('document-mode-active', label?.textContent?.trim() === activeLabel);
+        });
+    }).observe(document.body, { childList: true, subtree: true });
 }
 
 // Schedule auto-save with debouncing
@@ -168,10 +280,13 @@ async function saveDocument() {
         return;
     }
 
+    if (isExporting) return;
+    isExporting = true;
+
     try {
         debug('Starting document save...');
 
-        const blob = await editor.export({ format: 'docx' });
+        const blob = await editor.export({ format: 'docx', triggerDownload: false });
         if (!blob) {
             debug('Failed to export - no blob returned');
             return;
@@ -190,10 +305,16 @@ async function saveDocument() {
         debug(`Document sent to VS Code (${contentArray.length} bytes)`);
     } catch (error) {
         debug(`Error saving document: ${error.message}`);
+    } finally {
+        // Delay reset to catch any post-export microtask/reactivity updates
+        setTimeout(() => { isExporting = false; }, 100);
     }
 }
 
 // Handle messages from VS Code
+let lastExecutedCommandId = null;
+let commandExecuting = false;
+
 window.addEventListener('message', async event => {
     const message = event.data;
     if (!message?.type) {
@@ -212,11 +333,26 @@ window.addEventListener('message', async event => {
             }
             break;
 
-        case 'executeCommand':
-            debug(`Executing command: ${message.command}`);
-            const result = await executeCommand(message.command, message.args || {});
-            vscode.postMessage({ type: 'commandResult', ...result });
+        case 'executeCommand': {
+            // Prevent duplicate/concurrent command execution
+            const cmdId = message.id || `${message.command}:${JSON.stringify(message.args || {})}`;
+            if (cmdId === lastExecutedCommandId || commandExecuting) {
+                debug(`Skipping duplicate command: ${message.command}`);
+                break;
+            }
+            commandExecuting = true;
+            lastExecutedCommandId = cmdId;
+            try {
+                debug(`Executing command: ${message.command}`);
+                const result = await executeCommand(message.command, message.args || {});
+                vscode.postMessage({ type: 'commandResult', ...result });
+            } finally {
+                commandExecuting = false;
+                // Reset dedup so the next identical command (intentional repeat) is processed
+                lastExecutedCommandId = null;
+            }
             break;
+        }
     }
 });
 
@@ -237,7 +373,12 @@ const COMMANDS = {
     insertTableOfContents: cmdInsertTableOfContents,
     deleteTableOfContents: cmdDeleteTableOfContents,
     undo: cmdUndo,
-    redo: cmdRedo
+    redo: cmdRedo,
+    acceptAllChanges: cmdAcceptAllChanges,
+    rejectAllChanges: cmdRejectAllChanges,
+    focusHeader: cmdFocusHeader,
+    focusFooter: cmdFocusFooter,
+    exitHeaderFooter: cmdExitHeaderFooter
 };
 
 async function executeCommand(command, args) {
@@ -258,7 +399,17 @@ async function executeCommand(command, args) {
 // =============================================================================
 
 function getActiveEditor() {
-    return editor?.activeEditor || null;
+    // First check if there's a presentationEditor with getActiveEditor method
+    // This handles header/footer mode correctly
+    const baseEditor = editor?.activeEditor;
+    if (!baseEditor) return null;
+
+    const presentationEditor = baseEditor.presentationEditor || baseEditor._presentationEditor;
+    if (presentationEditor && typeof presentationEditor.getActiveEditor === 'function') {
+        return presentationEditor.getActiveEditor();
+    }
+
+    return baseEditor;
 }
 
 function requireActiveEditor() {
@@ -329,6 +480,12 @@ function insertAtPosition(activeEditor, position, content) {
 
 function selectRange(activeEditor, from, to) {
     activeEditor.view.focus();
+    activeEditor.commands.setTextSelection({ from, to: to ?? from });
+}
+
+// Like selectRange but without view.focus() — for programmatic commands
+// that should not steal focus from other VS Code UI elements.
+function selectRangeQuiet(activeEditor, from, to) {
     activeEditor.commands.setTextSelection({ from, to: to ?? from });
 }
 
@@ -412,7 +569,7 @@ function cmdGetNodes({ type }) {
     return { success: true, result: { nodes: result, count: result.length } };
 }
 
-async function cmdFormatText({ fontFamily, fontSize, color, highlight, bold, italic, underline, strikethrough, link, lineHeight, indent, spacingBefore, spacingAfter, scope }) {
+async function cmdFormatText({ fontFamily, fontSize, color, highlight, bold, italic, underline, strikethrough, link, lineHeight, indent, spacingBefore, spacingAfter, textAlign, scope }) {
     const { activeEditor, error } = requireActiveEditor();
     if (error) return error;
 
@@ -421,12 +578,13 @@ async function cmdFormatText({ fontFamily, fontSize, color, highlight, bold, ita
                       underline !== undefined || strikethrough !== undefined ||
                       link !== undefined ||
                       lineHeight !== undefined || indent !== undefined ||
-                      spacingBefore !== undefined || spacingAfter !== undefined;
+                      spacingBefore !== undefined || spacingAfter !== undefined ||
+                      textAlign !== undefined;
     if (!hasFormat) {
         return { success: false, error: 'At least one format option required' };
     }
 
-    const previousMode = editor.documentMode;
+    const previousMode = editor.config.documentMode || 'editing';
     editor.setDocumentMode('editing');
     applyScope(activeEditor, scope);
 
@@ -545,6 +703,15 @@ async function cmdFormatText({ fontFamily, fontSize, color, highlight, bold, ita
         }
     }
 
+    // Text alignment — left, center, right, justify
+    if (textAlign !== undefined) {
+        const validAligns = ['left', 'center', 'right', 'justify'];
+        if (validAligns.includes(textAlign)) {
+            activeEditor.commands.setTextAlign(textAlign);
+            applied.push(`textAlign: ${textAlign}`);
+        }
+    }
+
     // Restore previous mode
     editor.setDocumentMode(previousMode);
 
@@ -583,6 +750,7 @@ async function cmdReplaceText({ search, replacement, occurrence, author }) {
     debug(`replaceText: found ${matches.length} matches`);
 
     // Replace using proper positions from search
+    // Note: Each replacement is a separate undo step (TipTap limitation with track changes)
     for (const m of toReplace) {
         selectRange(activeEditor, m.from, m.to);
         activeEditor.commands.insertContent(replacement);
@@ -601,16 +769,20 @@ async function cmdInsertContent({ content, position, author }) {
 
     const anchor = position?.after || position?.before;
     const insertAfter = Boolean(position?.after);
-    const isEmptyDoc = activeEditor.state.doc.textContent.trim().length === 0;
+    const textContent = activeEditor.state.doc.textContent.trim();
+    const isEmptyDoc = textContent.length === 0;
+
+    // If no anchor provided and document is empty (or position is explicitly "start"/"end"), insert at position 1
+    const insertAtStart = !anchor || position?.before === '' || position?.after === '';
 
     // Validate before changing mode
-    if (!anchor && !isEmptyDoc) {
-        return { success: false, error: 'Position anchor required: use "after" or "before" with existing text' };
+    if (!insertAtStart && !isEmptyDoc && !anchor) {
+        return { success: false, error: 'Position anchor required: use "after" or "before" with existing text, or use empty string to insert at start' };
     }
 
     // Find anchor before changing mode (if needed)
     let insertPos = 1;
-    if (!isEmptyDoc) {
+    if (!insertAtStart && !isEmptyDoc && anchor) {
         const match = findAnchor(activeEditor, anchor);
         if (!match) {
             return { success: false, error: `Anchor text not found: "${anchor}"` };
@@ -622,7 +794,7 @@ async function cmdInsertContent({ content, position, author }) {
     setDocumentMode('suggesting');
 
     insertAtPosition(activeEditor, insertPos, content);
-    debug(isEmptyDoc ? 'insertContent: empty document' : `insertContent: ${insertAfter ? 'after' : 'before'} "${anchor}"`);
+    debug(isEmptyDoc || insertAtStart ? 'insertContent: at start of document' : `insertContent: ${insertAfter ? 'after' : 'before'} "${anchor}"`);
 
     await saveDocument();
     setDocumentMode('editing');
@@ -791,6 +963,69 @@ async function cmdRedo() {
         debug('redo: success');
     }
     return { success: result };
+}
+
+async function cmdAcceptAllChanges() {
+    const { activeEditor, error } = requireActiveEditor();
+    if (error) return error;
+
+    activeEditor.commands.acceptAllTrackedChanges();
+    await saveDocument();
+    debug('acceptAllChanges: success');
+    return { success: true };
+}
+
+async function cmdRejectAllChanges() {
+    const { activeEditor, error } = requireActiveEditor();
+    if (error) return error;
+
+    activeEditor.commands.rejectAllTrackedChanges();
+    await saveDocument();
+    debug('rejectAllChanges: success');
+    return { success: true };
+}
+
+// =============================================================================
+// Header/Footer Commands
+// =============================================================================
+
+function dispatchKeyboardShortcut(key, code, { ctrl = false, alt = false } = {}) {
+    const activeEditor = getActiveEditor();
+    const editorDom = activeEditor?.view?.dom;
+    if (!editorDom) return { error: 'Editor DOM not available' };
+
+    const container = editorDom.closest('.presentation-editor') || document.querySelector('.presentation-editor');
+    if (!container) return { error: 'Presentation editor container not found' };
+
+    container.dispatchEvent(new KeyboardEvent('keydown', {
+        key, code, ctrlKey: ctrl, altKey: alt, shiftKey: false, bubbles: true, cancelable: true
+    }));
+    return { success: true };
+}
+
+async function cmdFocusHeader() {
+    const result = dispatchKeyboardShortcut('h', 'KeyH', { ctrl: true, alt: true });
+    if (result.error) return { success: false, error: result.error };
+    await new Promise(resolve => setTimeout(resolve, 150));
+    debug('focusHeader: entered header mode');
+    return { success: true, result: { mode: 'header' } };
+}
+
+async function cmdFocusFooter() {
+    const result = dispatchKeyboardShortcut('f', 'KeyF', { ctrl: true, alt: true });
+    if (result.error) return { success: false, error: result.error };
+    await new Promise(resolve => setTimeout(resolve, 150));
+    debug('focusFooter: entered footer mode');
+    return { success: true, result: { mode: 'footer' } };
+}
+
+async function cmdExitHeaderFooter() {
+    const result = dispatchKeyboardShortcut('Escape', 'Escape');
+    if (result.error) return { success: false, error: result.error };
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await saveDocument();
+    debug('exitHeaderFooter: exited to body mode');
+    return { success: true, result: { mode: 'body' } };
 }
 
 /**
@@ -1025,26 +1260,245 @@ async function cmdAddComment({ search, comment, occurrence, author }) {
         return { success: false, error: searchError };
     }
 
-    selectRange(activeEditor, match.from, match.to);
+    // Use quiet selection to avoid stealing focus from other VS Code UI
+    selectRangeQuiet(activeEditor, match.from, match.to);
 
-    // Add comment via TipTap command
     const authorName = author?.name || editor.user?.name || 'Claude';
     const authorEmail = author?.email || editor.user?.email || 'claude@anthropic.com';
+    const commentId = crypto.randomUUID();
 
-    const result = activeEditor.commands.addComment({
-        content: comment,
-        author: authorName,
-        authorEmail: authorEmail
+    const result = activeEditor.commands.insertComment({
+        commentId,
+        commentText: comment,
+        creatorName: authorName,
+        creatorEmail: authorEmail,
+        skipEmit: true
     });
 
     if (!result) {
         return { success: false, error: 'Failed to add comment' };
     }
 
+    // Register the comment in the store for persistence.
+    // Use the original (non-intercepted) emit so 'add' events reach SuperDoc's
+    // onEditorCommentsUpdate handler, which adds the comment to the store.
+    // Use a dummy activeCommentId to prevent setActiveComment cascade.
+    originalEditorEmit('commentsUpdate', {
+        type: 'add',
+        comment: {
+            commentId,
+            commentText: comment,
+            creatorName: authorName,
+            creatorEmail: authorEmail,
+            createdTime: Date.now(),
+        },
+        activeCommentId: '__skip__',
+    });
+
+    // Collapse selection away from the comment mark
+    activeEditor.commands.setTextSelection({ from: match.to, to: match.to });
+
     await saveDocument();
     debug(`addComment: added comment on "${match.text}"`);
     return { success: true, result: { commentedText: match.text } };
 }
+
+// =============================================================================
+// Find & Replace
+// =============================================================================
+
+let searchMatches = [];
+let currentMatchIndex = -1;
+let searchBarOpen = false;
+let searchCaseSensitive = false;
+let replaceExpanded = false;
+
+function toggleReplace() {
+    replaceExpanded = !replaceExpanded;
+    const chevron = document.getElementById('search-expand');
+    const replaceRow = document.querySelector('.search-replace-row');
+    chevron.classList.toggle('expanded', replaceExpanded);
+    replaceRow.style.display = replaceExpanded ? 'flex' : 'none';
+    if (replaceExpanded) {
+        document.getElementById('replace-input').focus();
+    }
+}
+
+function openSearchBar() {
+    const bar = document.getElementById('search-bar');
+    bar.style.display = 'flex';
+    searchBarOpen = true;
+    const input = document.getElementById('search-input');
+    input.focus();
+    input.select();
+}
+
+function closeSearchBar() {
+    document.getElementById('search-bar').style.display = 'none';
+    searchBarOpen = false;
+    replaceExpanded = false;
+    document.getElementById('search-expand').classList.remove('expanded');
+    document.querySelector('.search-replace-row').style.display = 'none';
+    searchMatches = [];
+    currentMatchIndex = -1;
+    document.getElementById('search-count').textContent = '';
+    clearSearchHighlights();
+    editor?.activeEditor?.view?.focus();
+}
+
+function updateSearchCount() {
+    const countEl = document.getElementById('search-count');
+    if (searchMatches.length === 0) {
+        countEl.textContent = document.getElementById('search-input').value ? 'No results' : '';
+    } else {
+        countEl.textContent = `${currentMatchIndex + 1} of ${searchMatches.length}`;
+    }
+}
+
+function buildSearchPattern(query) {
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(escaped, searchCaseSensitive ? 'g' : 'gi');
+}
+
+function clearSearchHighlights() {
+    try { editor?.activeEditor?.commands.search('', { highlight: true }); } catch {}
+}
+
+// Run search, optionally preserving the current match index (e.g. after undo/replace)
+function runSearch(preserveIndex = false) {
+    const query = document.getElementById('search-input').value;
+    if (!query || !editor?.activeEditor) {
+        searchMatches = [];
+        currentMatchIndex = -1;
+        if (!query) clearSearchHighlights();
+        updateSearchCount();
+        return;
+    }
+    const prevIndex = currentMatchIndex;
+    searchMatches = editor.activeEditor.commands.search(buildSearchPattern(query), { highlight: true }) || [];
+    if (searchMatches.length > 0) {
+        currentMatchIndex = preserveIndex ? Math.max(0, Math.min(prevIndex, searchMatches.length - 1)) : 0;
+    } else {
+        currentMatchIndex = -1;
+    }
+    updateSearchCount();
+}
+
+function performSearch() { runSearch(false); }
+
+function refreshSearch() {
+    if (searchBarOpen) runSearch(true);
+}
+
+function toggleCaseSensitive() {
+    searchCaseSensitive = !searchCaseSensitive;
+    document.getElementById('search-case').classList.toggle('active', searchCaseSensitive);
+    clearSearchHighlights();
+    performSearch();
+    document.getElementById('search-input').focus();
+}
+
+function goToMatch(index) {
+    if (searchMatches.length === 0) return;
+    currentMatchIndex = index;
+    editor.activeEditor.commands.goToSearchResult(searchMatches[index]);
+    updateSearchCount();
+}
+
+function nextMatch() {
+    if (searchMatches.length === 0) return;
+    goToMatch((currentMatchIndex + 1) % searchMatches.length);
+}
+
+function prevMatch() {
+    if (searchMatches.length === 0) return;
+    goToMatch((currentMatchIndex - 1 + searchMatches.length) % searchMatches.length);
+}
+
+function replaceOne() {
+    if (searchMatches.length === 0 || currentMatchIndex < 0) return;
+    const match = searchMatches[currentMatchIndex];
+    const activeEditor = editor.activeEditor;
+
+    activeEditor.view.focus();
+    activeEditor.commands.setTextSelection({ from: match.from, to: match.to });
+    activeEditor.commands.insertContent(document.getElementById('replace-input').value);
+
+    runSearch(true);
+    if (searchMatches.length > 0) {
+        activeEditor.commands.goToSearchResult(searchMatches[currentMatchIndex]);
+    }
+    scheduleAutoSave();
+    document.getElementById('replace-input').focus();
+}
+
+function replaceAllMatches() {
+    if (searchMatches.length === 0) return;
+    const replaceValue = document.getElementById('replace-input').value;
+    const activeEditor = editor.activeEditor;
+
+    // Replace in reverse order to preserve positions
+    const sorted = [...searchMatches].sort((a, b) => b.from - a.from);
+    activeEditor.view.focus();
+    for (const match of sorted) {
+        activeEditor.commands.setTextSelection({ from: match.from, to: match.to });
+        activeEditor.commands.insertContent(replaceValue);
+    }
+
+    runSearch(false);
+    scheduleAutoSave();
+    document.getElementById('replace-input').focus();
+}
+
+// Wire up search bar buttons
+document.getElementById('search-expand').addEventListener('click', toggleReplace);
+document.getElementById('search-input').addEventListener('input', performSearch);
+document.getElementById('search-case').addEventListener('click', toggleCaseSensitive);
+document.getElementById('search-next').addEventListener('click', nextMatch);
+document.getElementById('search-prev').addEventListener('click', prevMatch);
+document.getElementById('search-close').addEventListener('click', closeSearchBar);
+document.getElementById('replace-one').addEventListener('click', replaceOne);
+document.getElementById('replace-all').addEventListener('click', replaceAllMatches);
+
+document.getElementById('search-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.shiftKey) {
+        e.preventDefault();
+        prevMatch();
+    } else if (e.key === 'Enter') {
+        e.preventDefault();
+        nextMatch();
+    } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeSearchBar();
+    }
+});
+
+document.getElementById('replace-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        replaceOne();
+    } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeSearchBar();
+    }
+});
+
+// Workaround: In VS Code webview (Electron), the click event from a tool button
+// mousedown can fire AFTER Vue mounts the CommentDialog and registers its
+// v-click-outside listener, causing the dialog to immediately dismiss.
+// Suppress click events that are part of the same physical press as a tool mousedown.
+let lastToolMousedownTime = 0;
+document.addEventListener('mousedown', (e) => {
+    if (e.target.closest('[data-id="is-tool"]') || e.target.closest('.superdoc__tools')) {
+        lastToolMousedownTime = Date.now();
+    }
+}, true);
+document.addEventListener('click', (e) => {
+    if (Date.now() - lastToolMousedownTime < 300) {
+        e.stopImmediatePropagation();
+        e.preventDefault();
+    }
+}, true);
 
 // Notify VS Code that the webview is ready
 debug('Notifying VS Code that webview is ready');
@@ -1052,6 +1506,11 @@ vscode.postMessage({ type: 'ready' });
 
 // Handle keyboard shortcuts
 document.addEventListener('keydown', (event) => {
+    // Ctrl/Cmd + F to open search
+    if ((event.ctrlKey || event.metaKey) && event.key === 'f') {
+        event.preventDefault();
+        openSearchBar();
+    }
     // Ctrl/Cmd + S to save
     if ((event.ctrlKey || event.metaKey) && event.key === 's') {
         event.preventDefault();

@@ -69,21 +69,29 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
     // Watch for command file (Claude API)
     const commandWatcher = this.setupCommandWatcher(document, webviewPanel.webview);
 
+    const cmdFilePath = this.getCommandFilePath(document.uri);
+
     webviewPanel.onDidDispose(() => {
       readyListener.dispose();
       fileWatcher.dispose();
       if (commandWatcher) {
         commandWatcher.close();
       }
+      // Clean up per-document state
+      const state = this._commandStates.get(cmdFilePath);
+      if (state?.writingTimer) clearTimeout(state.writingTimer);
+      this._commandStates.delete(cmdFilePath);
     });
   }
 
-  private setupFileWatcher(document: SuperDocDocument, webview: vscode.Webview): vscode.FileSystemWatcher {
+  private setupFileWatcher(document: SuperDocDocument, webview: vscode.Webview): { dispose: () => void } {
     const fileDir = vscode.Uri.joinPath(document.uri, '..');
     const fileName = path.basename(document.uri.fsPath);
     const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(fileDir, fileName)
     );
+
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
     watcher.onDidChange(async (uri) => {
       // Ignore our own saves (within 1 second)
@@ -92,16 +100,26 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
         return;
       }
 
-      debug(`External file change detected: ${uri.fsPath}`);
-      await document.reloadFromDisk();
-      debug(`Sending reload to webview, size: ${document.data.length} bytes`);
-      webview.postMessage({
-        type: 'reload',
-        content: { data: Array.from(document.data) },
-      });
+      // Debounce rapid external changes (e.g., editors that write temp + rename)
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(async () => {
+        reloadTimer = null;
+        debug(`External file change detected: ${uri.fsPath}`);
+        await document.reloadFromDisk();
+        debug(`Sending reload to webview, size: ${document.data.length} bytes`);
+        webview.postMessage({
+          type: 'reload',
+          content: { data: Array.from(document.data) },
+        });
+      }, 200);
     });
 
-    return watcher;
+    return {
+      dispose: () => {
+        if (reloadTimer) clearTimeout(reloadTimer);
+        watcher.dispose();
+      }
+    };
   }
 
   /**
@@ -116,12 +134,27 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
   /**
    * Setup watcher for command file (Claude API)
    * Each document watches its own file: .superdoc/{docname}.json
+   *
+   * fs.watch() may fire multiple events per write (known Node.js issue #7420).
+   * Three guards prevent duplicate execution:
+   *   1. lastProcessedId — skips same command before response is written
+   *   2. writingResponse — skips events during the 200ms response write window
+   *   3. !data.command  — skips events after response (file has no 'command' field)
    */
   private setupCommandWatcher(document: SuperDocDocument, webview: vscode.Webview): fs.FSWatcher | null {
     const cmdFilePath = this.getCommandFilePath(document.uri);
     const superdocDir = path.dirname(cmdFilePath);
     const cmdFileName = path.basename(cmdFilePath);
     let processing = false;
+
+    // Initialize per-document command state
+    this._commandStates.set(cmdFilePath, {
+      pendingFile: null,
+      writingResponse: false,
+      lastProcessedId: null,
+      writingTimer: null,
+    });
+    const state = this._commandStates.get(cmdFilePath)!;
 
     debug(`Setting up command watcher: ${cmdFilePath}`);
 
@@ -132,7 +165,8 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
     }
 
     const processIfExists = async () => {
-      if (processing || !fs.existsSync(cmdFilePath)) return;
+      if (processing || state.writingResponse || !fs.existsSync(cmdFilePath)) return;
+      processing = true;
 
       try {
         const content = fs.readFileSync(cmdFilePath, 'utf-8');
@@ -141,7 +175,14 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
         // Only process if it's a command (has 'command' field), not a response
         if (!data.command) return;
 
-        processing = true;
+        // Skip if this command was already processed (idempotency)
+        const commandId = data.id || `${data.command}:${JSON.stringify(data.args || {})}`;
+        if (commandId === state.lastProcessedId) {
+          debug(`Skipping duplicate command: ${data.command} (id: ${commandId})`);
+          return;
+        }
+
+        state.lastProcessedId = commandId;
         await this.processCommandFile(cmdFilePath, data, webview, document);
       } catch {
         // Ignore parse errors or missing file
@@ -150,17 +191,17 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
       }
     };
 
+    // Check if command file already exists
+    processIfExists();
+
     try {
-      const watcher = fs.watch(superdocDir, (eventType, filename) => {
+      const fsWatcher = fs.watch(superdocDir, (eventType, filename) => {
         if (filename === cmdFileName) {
           processIfExists();
         }
       });
 
-      // Check if command file already exists
-      processIfExists();
-
-      return watcher;
+      return fsWatcher;
     } catch (error) {
       debug(`Failed to setup command watcher: ${error}`);
       return null;
@@ -172,14 +213,15 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
    */
   private async processCommandFile(
     cmdFilePath: string,
-    cmd: { command: string; args?: Record<string, unknown> },
+    cmd: { command: string; args?: Record<string, unknown>; id?: string },
     webview: vscode.Webview,
     document: SuperDocDocument
   ): Promise<void> {
     debug(`Processing command: ${cmd.command}`);
 
-    // Store the file path for response writing
-    this.pendingCommandFile = cmdFilePath;
+    // Store the file path for response writing (per-document)
+    const state = this._commandStates.get(cmdFilePath);
+    if (state) state.pendingFile = cmdFilePath;
 
     let args = cmd.args || {};
 
@@ -197,7 +239,7 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
         }
       } catch (error) {
         // Write error response directly
-        this.writeCommandResponse({
+        this.writeCommandResponse(cmdFilePath, {
           success: false,
           error: `Failed to load image: ${error}`
         });
@@ -208,7 +250,8 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
     webview.postMessage({
       type: 'executeCommand',
       command: cmd.command,
-      args
+      args,
+      id: cmd.id,
     });
   }
 
@@ -289,21 +332,33 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
     return mimeTypes[ext] || 'image/png';
   }
 
-  // Track the command file path for writing responses
-  private pendingCommandFile: string | null = null;
+  // Per-document command state (keyed by command file path)
+  private _commandStates = new Map<string, {
+    pendingFile: string | null;
+    writingResponse: boolean;
+    lastProcessedId: string | null;
+    writingTimer: ReturnType<typeof setTimeout> | null;
+  }>();
 
   /**
    * Write response by overwriting the command file
    */
-  private writeCommandResponse(result: { success: boolean; result?: unknown; error?: string }): void {
-    if (!this.pendingCommandFile) {
+  private writeCommandResponse(cmdFilePath: string, result: { success: boolean; result?: unknown; error?: string }): void {
+    const state = this._commandStates.get(cmdFilePath);
+    if (!state?.pendingFile) {
       debug('No pending command file to write response to');
       return;
     }
 
     debug(`Writing response: success=${result.success}`);
-    fs.writeFileSync(this.pendingCommandFile, JSON.stringify(result, null, 2));
-    this.pendingCommandFile = null;
+    state.writingResponse = true;
+    fs.writeFileSync(state.pendingFile, JSON.stringify(result, null, 2));
+    state.pendingFile = null;
+    // Reset dedup so the next identical command (intentional repeat) is processed
+    state.lastProcessedId = null;
+    // Keep suppression active briefly to cover the debounced watcher callback
+    if (state.writingTimer) clearTimeout(state.writingTimer);
+    state.writingTimer = setTimeout(() => { state.writingResponse = false; state.writingTimer = null; }, 200);
   }
 
   private getWebviewContent(webview: vscode.Webview): string {
@@ -326,13 +381,39 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
       </head>
       <body>
         <div id="superdoc-toolbar"></div>
-        <div id="superdoc"></div>
+        <div id="search-bar" style="display: none;">
+          <button id="search-expand" class="search-icon-btn search-chevron" title="Toggle Replace"><svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M6 4l4 4-4 4"/></svg></button>
+          <div class="search-fields">
+            <div class="search-row">
+              <div class="search-input-wrap">
+                <input type="text" id="search-input" placeholder="Find" />
+                <button id="search-case" class="search-toggle-btn" title="Match Case">Aa</button>
+              </div>
+              <span id="search-count">No results</span>
+              <button id="search-prev" class="search-icon-btn" title="Previous Match"><svg width="16" height="16" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" d="M8 12V4m0 0L4 8m4-4l4 4"/></svg></button>
+              <button id="search-next" class="search-icon-btn" title="Next Match"><svg width="16" height="16" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" d="M8 4v8m0 0l4-4m-4 4L4 8"/></svg></button>
+              <button id="search-close" class="search-icon-btn" title="Close"><svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8 8.7L3.3 13.4 2.6 12.7 7.3 8 2.6 3.3 3.3 2.6 8 7.3l4.7-4.7.7.7L8.7 8l4.7 4.7-.7.7z"/></svg></button>
+            </div>
+            <div class="search-row search-replace-row" style="display: none;">
+              <div class="search-input-wrap">
+                <input type="text" id="replace-input" placeholder="Replace" />
+              </div>
+              <button id="replace-one" class="search-icon-btn" title="Replace"><svg width="16" height="16" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" d="M3 8h7m0 0L7 5m3 3L7 11"/></svg></button>
+              <button id="replace-all" class="search-icon-btn" title="Replace All"><svg width="16" height="16" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" d="M3 5h7m0 0L7 2m3 3L7 8M3 11h7m0 0L7 8m3 3l-3 3"/></svg></button>
+            </div>
+          </div>
+        </div>
+        <div id="superdoc-scroll-wrapper">
+          <div id="superdoc"></div>
+        </div>
         <script type="module" nonce="${nonce}" src="${scriptUri}"></script>
       </body>
       </html>`;
   }
 
   private setupMessageHandler(webview: vscode.Webview, document: SuperDocDocument): void {
+    const cmdFilePath = this.getCommandFilePath(document.uri);
+
     webview.onDidReceiveMessage(async (message) => {
       switch (message.type) {
         case 'update': {
@@ -347,7 +428,7 @@ export class SuperDocEditorProvider implements vscode.CustomEditorProvider<Super
           break;
         case 'commandResult': {
           // Overwrite command file with response
-          this.writeCommandResponse({
+          this.writeCommandResponse(cmdFilePath, {
             success: message.success,
             result: message.result,
             error: message.error

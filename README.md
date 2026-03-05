@@ -15,16 +15,37 @@ Edit and view DOCX files inside Visual Studio Code with [SuperDoc](https://githu
 Once installed, any `.docx` file you open will automatically use SuperDoc. Just open a file and start editing.
 
 ## **Install**
+
 To be notified when live on Marketplace, star this repository.
 
-Want it now? You can clone the repo and run it from source.
+### From source (development)
 
-```
+```bash
 npm install
 npm run compile
 ```
 
 Then press `F5` in VS Code to launch a development window.
+
+### Deploy to an existing VS Code installation
+
+After building, copy the compiled files and native dependencies to the installed extension:
+
+```bash
+npm run compile
+
+EXT=~/.vscode/extensions/superdoc.superdoc-vscode-extension-0.1.0
+
+cp dist/extension.js "$EXT/dist/"
+cp dist/webview/main.js "$EXT/dist/webview/"
+cp webview/style.css "$EXT/dist/webview/"
+
+for pkg in @parcel detect-libc is-glob is-extglob node-addon-api picomatch; do
+  cp -r "node_modules/$pkg" "$EXT/node_modules/"
+done
+```
+
+Then reload VS Code (`Cmd+Shift+P` → "Developer: Reload Window").
 
 ## **License**
 
